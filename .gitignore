@@ -1,0 +1,50 @@
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# ===========================
+# Generated data (auto-created on first backend run)
+# ===========================
+UrbanFlow/backend/data/
+
+# ===========================
+# Node.js
+# ===========================
+node_modules/
+
+# ===========================
+# IDE & OS
+# ===========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===========================
+# Planning artifacts (not needed in repo)
+# ===========================
+implementation_plan.md
+task.md
+
+# ===========================
+# Environment & secrets
+# ===========================
+.env
+.env.local
+*.log
