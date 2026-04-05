@@ -74,6 +74,7 @@ function SceneBackground({ color }) {
 function Scene3D() {
   const theme = useCurrentTheme();
   const config = THEME_3D[theme] || THEME_3D.dark;
+  const { state } = useStore();
 
   return (
     <Canvas
@@ -130,12 +131,12 @@ function Scene3D() {
       <OrbitControls
         enablePan
         enableZoom
-        enableRotate
+        enableRotate={!state.obstacleMode}
         maxPolarAngle={Math.PI / 2.2}
         minDistance={2}
         maxDistance={25}
         target={[0, 0, 0]}
-        autoRotate
+        autoRotate={!state.obstacleMode}
         autoRotateSpeed={0.3}
       />
     </Canvas>

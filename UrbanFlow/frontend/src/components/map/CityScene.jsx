@@ -1,24 +1,51 @@
 /**
  * CityScene — React Three Fiber component that renders the 3D city.
  * Roads are colored by traffic density. Buildings are extruded polygons.
+ * Includes animated vehicle, obstacle markers, and click-to-place obstacles.
  */
 
-import React, { useMemo, useRef } from 'react';
-import { useFrame } from '@react-three/fiber';
+import React, { useMemo, useRef, useState, useCallback } from 'react';
+import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
 import { useStore } from '../../store/Store';
 
 // Geo projection: convert lat/lng to local 3D coords (meters from center)
-const CENTER_LAT = 40.7484;
-const CENTER_LNG = -73.9857;
+const CENTER_LAT = 12.9716;
+const CENTER_LNG = 77.5946;
 const DEG_TO_M_LAT = 111320;
 const DEG_TO_M_LNG = 111320 * Math.cos(CENTER_LAT * Math.PI / 180);
 const SCALE = 0.03; // scale down for Three.js units
+
+// Grid constants (must match Store)
+const BLOCKS_X = 12, BLOCKS_Y = 8;
+const BLK_LAT = 0.0009, BLK_LNG = 0.0012;
 
 function geoToLocal(lng, lat) {
   const x = (lng - CENTER_LNG) * DEG_TO_M_LNG * SCALE;
   const z = -(lat - CENTER_LAT) * DEG_TO_M_LAT * SCALE; // negative Z = north
   return [x, z];
+}
+
+function localToNodeId(x, z) {
+  // Reverse geoToLocal to get approximate lat/lng, then snap to grid node
+  const lng = x / (DEG_TO_M_LNG * SCALE) + CENTER_LNG;
+  const lat = -z / (DEG_TO_M_LAT * SCALE) + CENTER_LAT;
+
+  // Find nearest grid node
+  let bestR = 0, bestC = 0, bestDist = Infinity;
+  for (let r = 0; r <= BLOCKS_Y; r++) {
+    for (let c = 0; c <= BLOCKS_X; c++) {
+      const nodeLat = CENTER_LAT + (r - BLOCKS_Y / 2) * BLK_LAT;
+      const nodeLng = CENTER_LNG + (c - BLOCKS_X / 2) * BLK_LNG;
+      const dist = Math.sqrt((lat - nodeLat) ** 2 + (lng - nodeLng) ** 2);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestR = r;
+        bestC = c;
+      }
+    }
+  }
+  return { nodeId: `n_${bestR}_${bestC}`, row: bestR, col: bestC };
 }
 
 // Traffic color mapping
@@ -274,6 +301,339 @@ function EmergencyRoute() {
 }
 
 // =========================================
+// Animated Vehicle (Ambulance)
+// =========================================
+function AnimatedVehicle() {
+  const { state, dispatch } = useStore();
+  const vehicleRef = useRef();
+  const progressRef = useRef(0);
+  const trailRef = useRef();
+  const sirenRef = useRef();
+  const sirenTimeRef = useRef(0);
+
+  const VEHICLE_SPEED = 0.06; // Units per second along the curve
+
+  const curve = useMemo(() => {
+    if (!state.routeResult || !state.routeResult.coordinates || state.routeResult.coordinates.length < 2) return null;
+
+    const points = state.routeResult.coordinates.map(({ lat, lng }) => {
+      const [x, z] = geoToLocal(lng, lat);
+      return new THREE.Vector3(x, 0.15, z);
+    });
+
+    return new THREE.CatmullRomCurve3(points);
+  }, [state.routeResult]);
+
+  // Reset progress when route changes
+  useMemo(() => {
+    progressRef.current = 0;
+  }, [state.routeResult]);
+
+  useFrame((_, delta) => {
+    if (!curve || !vehicleRef.current || !state.vehicleMoving) return;
+
+    // Advance progress
+    const totalLength = curve.getLength();
+    const step = (VEHICLE_SPEED / totalLength) * delta * 60; // Normalize by curve length
+    progressRef.current = Math.min(1, progressRef.current + step);
+
+    // Get position on curve
+    const point = curve.getPointAt(progressRef.current);
+    vehicleRef.current.position.copy(point);
+
+    // Look ahead for rotation
+    const lookAhead = Math.min(1, progressRef.current + 0.02);
+    const targetPoint = curve.getPointAt(lookAhead);
+    const direction = new THREE.Vector3().subVectors(targetPoint, point);
+    if (direction.length() > 0.001) {
+      const angle = Math.atan2(direction.x, direction.z);
+      vehicleRef.current.rotation.y = angle;
+    }
+
+    // Siren flash
+    sirenTimeRef.current += delta;
+    if (sirenRef.current) {
+      const flash = Math.sin(sirenTimeRef.current * 12) > 0;
+      sirenRef.current.material.color.set(flash ? '#ef4444' : '#3b82f6');
+      sirenRef.current.material.emissive.set(flash ? '#ef4444' : '#3b82f6');
+    }
+
+    // Update store progress (throttled)
+    const progress = Math.round(progressRef.current * 100);
+    if (progress % 2 === 0) {
+      dispatch({ type: 'SET_VEHICLE_PROGRESS', payload: progressRef.current });
+    }
+
+    // Stop at end
+    if (progressRef.current >= 1) {
+      dispatch({ type: 'SET_VEHICLE_MOVING', payload: false });
+    }
+  });
+
+  if (!curve || !state.vehicleMoving) return null;
+
+  return (
+    <group ref={vehicleRef}>
+      {/* Ambulance body — large and visible */}
+      <mesh position={[0, 0.1, 0]}>
+        <boxGeometry args={[0.2, 0.14, 0.35]} />
+        <meshStandardMaterial color="#ffffff" roughness={0.3} metalness={0.5} />
+      </mesh>
+
+      {/* Red stripe band */}
+      <mesh position={[0, 0.1, 0]}>
+        <boxGeometry args={[0.205, 0.04, 0.355]} />
+        <meshStandardMaterial color="#ef4444" roughness={0.4} metalness={0.3} />
+      </mesh>
+
+      {/* Red cross on top */}
+      <mesh position={[0, 0.175, 0]}>
+        <boxGeometry args={[0.18, 0.005, 0.04]} />
+        <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={0.5} />
+      </mesh>
+      <mesh position={[0, 0.175, 0]}>
+        <boxGeometry args={[0.04, 0.005, 0.18]} />
+        <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={0.5} />
+      </mesh>
+
+      {/* Cabin (front windshield) */}
+      <mesh position={[0, 0.19, 0.12]}>
+        <boxGeometry args={[0.17, 0.08, 0.1]} />
+        <meshStandardMaterial color="#93c5fd" roughness={0.2} metalness={0.7} transparent opacity={0.75} />
+      </mesh>
+
+      {/* Siren light bar */}
+      <mesh ref={sirenRef} position={[0, 0.22, 0]}>
+        <boxGeometry args={[0.12, 0.03, 0.04]} />
+        <meshStandardMaterial
+          color="#ef4444"
+          emissive="#ef4444"
+          emissiveIntensity={3}
+          roughness={0.1}
+        />
+      </mesh>
+
+      {/* Siren glow light */}
+      <pointLight
+        position={[0, 0.3, 0]}
+        color="#ef4444"
+        intensity={1.5}
+        distance={2.5}
+        decay={2}
+      />
+
+      {/* Headlights */}
+      <pointLight position={[0, 0.1, 0.25]} color="#fffbe6" intensity={0.8} distance={1.5} decay={2} />
+
+      {/* Vehicle trail glow */}
+      <mesh position={[0, 0.05, -0.2]}>
+        <sphereGeometry args={[0.08, 8, 8]} />
+        <meshBasicMaterial color="#ef4444" transparent opacity={0.12} />
+      </mesh>
+
+      {/* Wheels — 4 corners */}
+      {[
+        [-0.1, 0.02, 0.1], [0.1, 0.02, 0.1],
+        [-0.1, 0.02, -0.1], [0.1, 0.02, -0.1]
+      ].map((pos, i) => (
+        <mesh key={i} position={pos} rotation={[0, 0, Math.PI / 2]}>
+          <cylinderGeometry args={[0.025, 0.025, 0.03, 12]} />
+          <meshStandardMaterial color="#1a1a1a" roughness={0.8} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+// =========================================
+// Obstacle Markers
+// =========================================
+function ObstacleMarkers() {
+  const { state } = useStore();
+  const timeRef = useRef(0);
+  const ringsRef = useRef([]);
+
+  useFrame((_, delta) => {
+    timeRef.current += delta;
+
+    // Pulse rings
+    ringsRef.current.forEach((ring) => {
+      if (ring) {
+        const scale = 1 + Math.sin(timeRef.current * 3) * 0.15;
+        ring.scale.set(scale, scale, scale);
+        ring.material.opacity = 0.4 + Math.sin(timeRef.current * 4) * 0.2;
+      }
+    });
+  });
+
+  if (!state.obstacles || state.obstacles.length === 0) return null;
+
+  return (
+    <group>
+      {state.obstacles.map((obstacle, idx) => (
+        <group key={obstacle.id} position={[obstacle.position.x, 0, obstacle.position.z]}>
+          {/* Construction barricade base */}
+          <mesh position={[0, 0.04, 0]}>
+            <boxGeometry args={[0.12, 0.08, 0.04]} />
+            <meshStandardMaterial color="#f97316" roughness={0.5} metalness={0.3} />
+          </mesh>
+
+          {/* Black warning stripes */}
+          <mesh position={[0, 0.04, 0.021]}>
+            <planeGeometry args={[0.12, 0.08]} />
+            <meshBasicMaterial color="#000000" transparent opacity={0.4} />
+          </mesh>
+
+          {/* Top warning bar */}
+          <mesh position={[0, 0.09, 0]}>
+            <boxGeometry args={[0.14, 0.015, 0.015]} />
+            <meshStandardMaterial color="#fbbf24" roughness={0.4} metalness={0.4} emissive="#f59e0b" emissiveIntensity={0.5} />
+          </mesh>
+
+          {/* Warning cone */}
+          <mesh position={[0, 0.13, 0]}>
+            <coneGeometry args={[0.02, 0.05, 8]} />
+            <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={1} roughness={0.3} />
+          </mesh>
+
+          {/* Support legs */}
+          <mesh position={[-0.05, 0.02, 0]}>
+            <boxGeometry args={[0.01, 0.04, 0.04]} />
+            <meshStandardMaterial color="#78716c" roughness={0.7} />
+          </mesh>
+          <mesh position={[0.05, 0.02, 0]}>
+            <boxGeometry args={[0.01, 0.04, 0.04]} />
+            <meshStandardMaterial color="#78716c" roughness={0.7} />
+          </mesh>
+
+          {/* Pulsing warning ring */}
+          <mesh
+            ref={(el) => { ringsRef.current[idx] = el; }}
+            rotation={[-Math.PI / 2, 0, 0]}
+            position={[0, 0.02, 0]}
+          >
+            <ringGeometry args={[0.08, 0.12, 32]} />
+            <meshBasicMaterial color="#f97316" transparent opacity={0.4} side={THREE.DoubleSide} />
+          </mesh>
+
+          {/* Warning glow light */}
+          <pointLight position={[0, 0.15, 0]} color="#f97316" intensity={0.3} distance={0.8} decay={2} />
+        </group>
+      ))}
+    </group>
+  );
+}
+
+// =========================================
+// Click-to-Place Obstacles (Ground Raycaster)
+// =========================================
+function ClickToPlaceObstacle() {
+  const { state, addObstacle } = useStore();
+  const planeRef = useRef();
+  const { camera, raycaster, gl } = useThree();
+  const [hoverPos, setHoverPos] = useState(null);
+
+  const handleClick = useCallback((event) => {
+    if (!state.obstacleMode) return;
+
+    // Calculate mouse position
+    const rect = gl.domElement.getBoundingClientRect();
+    const mouse = new THREE.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1
+    );
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(planeRef.current);
+
+    if (intersects.length > 0) {
+      const point = intersects[0].point;
+      const { nodeId, row, col } = localToNodeId(point.x, point.z);
+
+      // Don't place duplicate obstacles
+      if (state.obstacles.some(o => o.nodeId === nodeId)) return;
+
+      // Get the node's lat/lng for reference
+      const lat = CENTER_LAT + (row - BLOCKS_Y / 2) * BLK_LAT;
+      const lng = CENTER_LNG + (col - BLOCKS_X / 2) * BLK_LNG;
+
+      // Snap to the exact grid node position
+      const [snapX, snapZ] = geoToLocal(lng, lat);
+
+      addObstacle({
+        id: `obs_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        nodeId,
+        position: { x: snapX, z: snapZ },
+        lat,
+        lng,
+      });
+    }
+  }, [state.obstacleMode, state.obstacles, camera, raycaster, gl, addObstacle]);
+
+  const handleMove = useCallback((event) => {
+    if (!state.obstacleMode) {
+      setHoverPos(null);
+      return;
+    }
+
+    const rect = gl.domElement.getBoundingClientRect();
+    const mouse = new THREE.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1
+    );
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(planeRef.current);
+
+    if (intersects.length > 0) {
+      const point = intersects[0].point;
+      const { row, col } = localToNodeId(point.x, point.z);
+      const lat = CENTER_LAT + (row - BLOCKS_Y / 2) * BLK_LAT;
+      const lng = CENTER_LNG + (col - BLOCKS_X / 2) * BLK_LNG;
+      const [snapX, snapZ] = geoToLocal(lng, lat);
+      setHoverPos({ x: snapX, z: snapZ });
+    } else {
+      setHoverPos(null);
+    }
+  }, [state.obstacleMode, camera, raycaster, gl]);
+
+  // Register event listeners
+  React.useEffect(() => {
+    const canvas = gl.domElement;
+    canvas.addEventListener('click', handleClick);
+    canvas.addEventListener('mousemove', handleMove);
+    return () => {
+      canvas.removeEventListener('click', handleClick);
+      canvas.removeEventListener('mousemove', handleMove);
+    };
+  }, [gl, handleClick, handleMove]);
+
+  return (
+    <>
+      {/* Invisible ground plane for raycasting */}
+      <mesh ref={planeRef} rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.01, 0]} visible={false}>
+        <planeGeometry args={[50, 50]} />
+        <meshBasicMaterial transparent opacity={0} />
+      </mesh>
+
+      {/* Hover preview */}
+      {state.obstacleMode && hoverPos && (
+        <group position={[hoverPos.x, 0.02, hoverPos.z]}>
+          <mesh rotation={[-Math.PI / 2, 0, 0]}>
+            <ringGeometry args={[0.06, 0.1, 32]} />
+            <meshBasicMaterial color="#f97316" transparent opacity={0.5} side={THREE.DoubleSide} />
+          </mesh>
+          <mesh position={[0, 0.05, 0]}>
+            <boxGeometry args={[0.12, 0.08, 0.04]} />
+            <meshBasicMaterial color="#f97316" transparent opacity={0.3} wireframe />
+          </mesh>
+        </group>
+      )}
+    </>
+  );
+}
+
+// =========================================
 // Ground Plane
 // =========================================
 function Ground({ theme = 'dark' }) {
@@ -364,6 +724,9 @@ export default function CityScene({ theme = 'dark' }) {
       <RoadNetwork />
       <Buildings theme={theme} />
       <EmergencyRoute />
+      <AnimatedVehicle />
+      <ObstacleMarkers />
+      <ClickToPlaceObstacle />
       <AccidentMarkers />
     </>
   );

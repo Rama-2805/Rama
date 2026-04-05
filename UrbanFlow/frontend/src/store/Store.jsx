@@ -11,7 +11,7 @@ const StoreContext = createContext(null);
 // Demo Data Generator (works without backend)
 // ============================================
 function generateDemoRoads() {
-  const CENTER_LAT = 40.7484, CENTER_LNG = -73.9857;
+  const CENTER_LAT = 12.9716, CENTER_LNG = 77.5946;
   const BLOCKS_X = 12, BLOCKS_Y = 8;
   const BLK_LAT = 0.0009, BLK_LNG = 0.0012;
   const features = [];
@@ -64,7 +64,7 @@ function generateDemoRoads() {
 }
 
 function generateDemoBuildings() {
-  const CENTER_LAT = 40.7484, CENTER_LNG = -73.9857;
+  const CENTER_LAT = 12.9716, CENTER_LNG = 77.5946;
   const BLOCKS_X = 12, BLOCKS_Y = 8;
   const BLK_LAT = 0.0009, BLK_LNG = 0.0012;
   const features = [];
@@ -114,6 +114,14 @@ const initialState = {
   loading: true,
   error: null,
   graphNodes: [],
+  // Vehicle & Obstacle state
+  obstacles: [],
+  obstacleMode: false,
+  vehicleProgress: 0,
+  vehicleMoving: false,
+  rerouting: false,
+  lastRouteOrigin: null,
+  lastRouteDestination: null,
 };
 
 function reducer(state, action) {
@@ -135,7 +143,7 @@ function reducer(state, action) {
     case 'SET_ROUTE_LOADING':
       return { ...state, routeLoading: action.payload };
     case 'SET_ROUTE_RESULT':
-      return { ...state, routeResult: action.payload, routeLoading: false };
+      return { ...state, routeResult: action.payload, routeLoading: false, vehicleProgress: 0, vehicleMoving: !!action.payload, rerouting: false };
     case 'SELECT_SEGMENT':
       return { ...state, selectedSegment: action.payload };
     case 'SET_LOADING':
@@ -144,6 +152,23 @@ function reducer(state, action) {
       return { ...state, error: action.payload };
     case 'SET_GRAPH_NODES':
       return { ...state, graphNodes: action.payload };
+    // Vehicle & Obstacle actions
+    case 'SET_OBSTACLE_MODE':
+      return { ...state, obstacleMode: action.payload !== undefined ? action.payload : !state.obstacleMode };
+    case 'ADD_OBSTACLE':
+      return { ...state, obstacles: [...state.obstacles, action.payload] };
+    case 'REMOVE_OBSTACLE':
+      return { ...state, obstacles: state.obstacles.filter(o => o.id !== action.payload) };
+    case 'CLEAR_OBSTACLES':
+      return { ...state, obstacles: [] };
+    case 'SET_VEHICLE_PROGRESS':
+      return { ...state, vehicleProgress: action.payload };
+    case 'SET_VEHICLE_MOVING':
+      return { ...state, vehicleMoving: action.payload };
+    case 'SET_REROUTING':
+      return { ...state, rerouting: action.payload };
+    case 'SET_LAST_ROUTE_ENDPOINTS':
+      return { ...state, lastRouteOrigin: action.payload.origin, lastRouteDestination: action.payload.destination };
     default:
       return state;
   }
@@ -229,39 +254,92 @@ export function StoreProvider({ children }) {
     }, 1000);
   }, []);
 
-  // ---- Demo Route ----
-  const demoRoute = useCallback((origin, destination) => {
-    dispatch({ type: 'SET_ROUTE_LOADING', payload: true });
-    setTimeout(() => {
-      // Parse node IDs
-      const parseNode = (id) => { const p = id.split('_'); return { row: parseInt(p[1]), col: parseInt(p[2]) }; };
-      const o = parseNode(origin), d = parseNode(destination);
+  // ---- A* Pathfinding with obstacle avoidance ----
+  const findPathAStar = useCallback((origin, destination, blockedNodes) => {
+    const CENTER_LAT = 12.9716, CENTER_LNG = 77.5946, BLK_LAT = 0.0009, BLK_LNG = 0.0012, BX = 12, BY = 8;
+    const parseNode = (id) => { const p = id.split('_'); return { row: parseInt(p[1]), col: parseInt(p[2]) }; };
+    const nodeToId = (r, c) => `n_${r}_${c}`;
+    const nodeToCoord = (r, c) => ({ lat: CENTER_LAT + (r - BY/2) * BLK_LAT, lng: CENTER_LNG + (c - BX/2) * BLK_LNG });
 
-      // Simple path: go horizontal then vertical
-      const path = [];
-      const coords = [];
-      const CENTER_LAT = 40.7484, CENTER_LNG = -73.9857, BLK_LAT = 0.0009, BLK_LNG = 0.0012, BX = 12, BY = 8;
+    const o = parseNode(origin), d = parseNode(destination);
+    const blockedSet = new Set(blockedNodes.map(b => b.nodeId));
 
-      let r = o.row, c = o.col;
-      while (c !== d.col) {
-        path.push(`n_${r}_${c}`);
-        coords.push({ lat: CENTER_LAT + (r - BY/2) * BLK_LAT, lng: CENTER_LNG + (c - BX/2) * BLK_LNG });
-        c += c < d.col ? 1 : -1;
+    // A* heuristic: Manhattan distance
+    const heuristic = (r, c) => Math.abs(r - d.row) + Math.abs(c - d.col);
+
+    // Priority queue (simple sorted array for small grid)
+    const openSet = [{ r: o.row, c: o.col, g: 0, f: heuristic(o.row, o.col), parent: null }];
+    const closed = new Set();
+    const cameFrom = {};
+    const gScore = {};
+    gScore[nodeToId(o.row, o.col)] = 0;
+
+    const directions = [[0,1],[0,-1],[1,0],[-1,0]]; // NESW
+
+    while (openSet.length > 0) {
+      // Get lowest f-score
+      openSet.sort((a, b) => a.f - b.f);
+      const current = openSet.shift();
+      const currentId = nodeToId(current.r, current.c);
+
+      if (current.r === d.row && current.c === d.col) {
+        // Reconstruct path
+        const path = [];
+        const coords = [];
+        let node = currentId;
+        while (node) {
+          path.unshift(node);
+          const p = parseNode(node);
+          coords.unshift(nodeToCoord(p.row, p.col));
+          node = cameFrom[node];
+        }
+        return { path, coordinates: coords, segment_ids: [], total_cost: path.length * 330, estimated_time_minutes: Math.round(path.length * 0.4 * 10) / 10, nodes_visited: closed.size };
       }
-      while (r !== d.row) {
-        path.push(`n_${r}_${c}`);
-        coords.push({ lat: CENTER_LAT + (r - BY/2) * BLK_LAT, lng: CENTER_LNG + (c - BX/2) * BLK_LNG });
-        r += r < d.row ? 1 : -1;
-      }
-      path.push(`n_${r}_${c}`);
-      coords.push({ lat: CENTER_LAT + (r - BY/2) * BLK_LAT, lng: CENTER_LNG + (c - BX/2) * BLK_LNG });
 
-      dispatch({
-        type: 'SET_ROUTE_RESULT',
-        payload: { path, coordinates: coords, segment_ids: [], total_cost: path.length * 330, estimated_time_minutes: Math.round(path.length * 0.4 * 10) / 10, nodes_visited: path.length * 2 },
-      });
-    }, 500);
+      closed.add(currentId);
+
+      for (const [dr, dc] of directions) {
+        const nr = current.r + dr, nc = current.c + dc;
+        if (nr < 0 || nr > BY || nc < 0 || nc > BX) continue;
+        const neighborId = nodeToId(nr, nc);
+        if (closed.has(neighborId)) continue;
+        if (blockedSet.has(neighborId)) continue; // Skip obstacle nodes
+
+        const tentativeG = current.g + 1;
+        if (tentativeG < (gScore[neighborId] ?? Infinity)) {
+          gScore[neighborId] = tentativeG;
+          cameFrom[neighborId] = currentId;
+          const f = tentativeG + heuristic(nr, nc);
+          // Check if already in openSet
+          const existing = openSet.find(n => n.r === nr && n.c === nc);
+          if (existing) {
+            existing.g = tentativeG;
+            existing.f = f;
+          } else {
+            openSet.push({ r: nr, c: nc, g: tentativeG, f, parent: currentId });
+          }
+        }
+      }
+    }
+
+    return null; // No path found
   }, []);
+
+  // ---- Demo Route (with obstacle support) ----
+  const demoRoute = useCallback((origin, destination, obstacles = []) => {
+    dispatch({ type: 'SET_ROUTE_LOADING', payload: true });
+    dispatch({ type: 'SET_LAST_ROUTE_ENDPOINTS', payload: { origin, destination } });
+    setTimeout(() => {
+      const result = findPathAStar(origin, destination, obstacles);
+      if (result) {
+        dispatch({ type: 'SET_ROUTE_RESULT', payload: result });
+      } else {
+        // No route found — still set result with info
+        dispatch({ type: 'SET_ROUTE_RESULT', payload: null });
+        dispatch({ type: 'ADD_EVENT', payload: { type: 'route_blocked', severity: 'critical', segment_id: 'N/A', timestamp: Date.now() / 1000 } });
+      }
+    }, 300);
+  }, [findPathAStar]);
 
   // ---- Fetch geodata from backend ----
   const fetchGeodata = useCallback(async () => {
@@ -331,7 +409,7 @@ export function StoreProvider({ children }) {
   const requestRouteREST = useCallback(async (origin, destination) => {
     // In demo mode, use client-side routing
     if (demoIntervalRef.current) {
-      demoRoute(origin, destination);
+      demoRoute(origin, destination, obstaclesRef.current);
       return;
     }
     dispatch({ type: 'SET_ROUTE_LOADING', payload: true });
@@ -349,6 +427,45 @@ export function StoreProvider({ children }) {
     }
   }, [demoRoute]);
 
+  // ---- Obstacle management ----
+  const obstaclesRef = useRef([]);
+  const lastRouteRef = useRef({ origin: null, destination: null });
+
+  const addObstacle = useCallback((obstacle) => {
+    dispatch({ type: 'ADD_OBSTACLE', payload: obstacle });
+    obstaclesRef.current = [...obstaclesRef.current, obstacle];
+
+    // Auto-reroute if a route exists
+    const { origin, destination } = lastRouteRef.current;
+    if (origin && destination) {
+      dispatch({ type: 'SET_REROUTING', payload: true });
+      dispatch({ type: 'ADD_EVENT', payload: { type: 'reroute', severity: 'moderate', segment_id: obstacle.nodeId, timestamp: Date.now() / 1000 } });
+      setTimeout(() => {
+        demoRoute(origin, destination, obstaclesRef.current);
+      }, 400);
+    }
+  }, [demoRoute]);
+
+  const clearObstacles = useCallback(() => {
+    dispatch({ type: 'CLEAR_OBSTACLES' });
+    obstaclesRef.current = [];
+
+    // Re-route without obstacles
+    const { origin, destination } = lastRouteRef.current;
+    if (origin && destination) {
+      demoRoute(origin, destination, []);
+    }
+  }, [demoRoute]);
+
+  const toggleObstacleMode = useCallback(() => {
+    dispatch({ type: 'SET_OBSTACLE_MODE', payload: undefined });
+  }, []);
+
+  // Track last route endpoints
+  useEffect(() => {
+    // We read from a custom ref approach — update ref when route endpoints change
+  }, []);
+
   // Initialize
   useEffect(() => {
     fetchGeodata();
@@ -364,8 +481,18 @@ export function StoreProvider({ children }) {
     };
   }, []);
 
+  // Keep lastRouteRef in sync
+  const wrappedRequestRouteREST = useCallback(async (origin, destination) => {
+    lastRouteRef.current = { origin, destination };
+    return requestRouteREST(origin, destination);
+  }, [requestRouteREST]);
+
   return (
-    <StoreContext.Provider value={{ state, dispatch, requestRoute, requestRouteREST }}>
+    <StoreContext.Provider value={{
+      state, dispatch, requestRoute,
+      requestRouteREST: wrappedRequestRouteREST,
+      addObstacle, clearObstacles, toggleObstacleMode,
+    }}>
       {children}
     </StoreContext.Provider>
   );
